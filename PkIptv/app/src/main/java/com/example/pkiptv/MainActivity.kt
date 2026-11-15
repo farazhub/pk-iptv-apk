@@ -58,6 +58,10 @@ class MainActivity : AppCompatActivity() {
     private var fullscreen = false
     private var playlistLoaded = false
     private var splashMinElapsed = false
+    private var attempt = 0
+    private var currentChannel: Channel? = null
+
+    private val vlcUa = "VLC/3.0.20 LibVLC/3.0.20"
 
     private val defaultUa =
         "Mozilla/5.0 (Linux; Android 11; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -107,10 +111,26 @@ class MainActivity : AppCompatActivity() {
                     player.prepare()
                     return
                 }
+                val ch = currentChannel
+                if (ch != null && isRetryable(error)) {
+                    val total = identities(ch).size
+                    if (attempt + 1 < total) {
+                        attempt++
+                        spinner.visibility = View.VISIBLE
+                        showStatus(
+                            "Trying another way to connect...",
+                            "Attempt ${attempt + 1} of $total for ${ch.name}.",
+                            false, null
+                        )
+                        startPlayback(ch)
+                        return
+                    }
+                }
                 val (title, detail) = describe(error)
                 val hint = if (fullscreen) "Press Up/Down to try another channel, or Left to open the list."
                 else "Pick another channel from the list."
-                showStatus(title, "$detail $hint", true, "Technical info: ${error.errorCodeName}")
+                showStatus(title, "$detail $hint", true,
+                    "Technical info: ${error.errorCodeName} (tried ${attempt + 1} connection method(s))")
             }
         })
 
@@ -202,12 +222,39 @@ class MainActivity : AppCompatActivity() {
         spinner.visibility = View.VISIBLE
         showNowPlaying(c.name)
 
+        currentChannel = c
+        attempt = 0
+        startPlayback(c)
+    }
+
+    // Different servers accept different "identities". Try the most compatible first.
+    private fun identities(c: Channel): List<Pair<String, String?>> {
+        val origin = try {
+            val u = URL(c.url); "${u.protocol}://${u.host}/"
+        } catch (e: Exception) { null }
+        val out = mutableListOf<Pair<String, String?>>()
+        if (c.userAgent != null || c.referrer != null) out.add(Pair(c.userAgent ?: vlcUa, c.referrer))
+        out.add(Pair(vlcUa, null))
+        out.add(Pair(defaultUa, origin))
+        out.add(Pair(defaultUa, null))
+        out.add(Pair("okhttp/4.12.0", null))
+        return out
+    }
+
+    private fun isRetryable(e: PlaybackException): Boolean =
+        e.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
+        e.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE ||
+        e.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
+
+    private fun startPlayback(c: Channel) {
+        val ids = identities(c)
+        val (ua, ref) = ids[attempt.coerceAtMost(ids.size - 1)]
         val http = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(15000)
-            .setUserAgent(c.userAgent ?: defaultUa)
-        c.referrer?.let { http.setDefaultRequestProperties(mapOf("Referer" to it)) }
+            .setUserAgent(ua)
+        ref?.let { http.setDefaultRequestProperties(mapOf("Referer" to it)) }
         val source = DefaultMediaSourceFactory(http).createMediaSource(MediaItem.fromUri(c.url))
         player.setMediaSource(source)
         player.prepare()
