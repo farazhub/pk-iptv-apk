@@ -5,8 +5,8 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <application
         android:usesCleartextTraffic="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:banner="@android:drawable/sym_def_app_icon"
+        android:icon="@drawable/ic_launcher"
+        android:banner="@drawable/banner"
         android:label="PK IPTV"
         android:theme="@style/Theme.AppCompat.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
