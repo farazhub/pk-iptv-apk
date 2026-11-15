@@ -5,6 +5,7 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <application
         android:usesCleartextTraffic="true"
+        android:largeHeap="true"
         android:icon="@drawable/ic_launcher"
         android:banner="@drawable/banner"
         android:label="PK IPTV"

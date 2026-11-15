@@ -29,8 +29,19 @@ data class Channel(
     val name: String,
     val url: String,
     val referrer: String? = null,
-    val userAgent: String? = null
+    val userAgent: String? = null,
+    val country: String = "",
+    val cats: Set<String> = emptySet(),
+    @Volatile var state: Int = 0   // 0 = not checked, 1 = working, 2 = offline
 )
+
+class CategoryDef(
+    val title: String,
+    val isHeader: Boolean = false,
+    val match: (Channel) -> Boolean = { false }
+)
+
+class Meta(val country: String, val cats: Set<String>, val bad: Boolean)
 
 @androidx.annotation.OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -42,33 +53,90 @@ class MainActivity : AppCompatActivity() {
     private lateinit var splash: View
     private lateinit var emptyHint: TextView
     private lateinit var nowPlaying: TextView
+    private lateinit var headerTitle: TextView
     private lateinit var headerCount: TextView
+    private lateinit var footerHint: TextView
     private lateinit var spinner: ProgressBar
     private lateinit var statusBox: View
     private lateinit var statusTitle: TextView
     private lateinit var statusDetail: TextView
     private lateinit var statusTech: TextView
-    private lateinit var adapter: ChannelAdapter
+    private lateinit var channelAdapter: ChannelAdapter
+    private lateinit var categoryAdapter: CategoryAdapter
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideNowPlaying = Runnable { nowPlaying.visibility = View.GONE }
 
-    private var channels = listOf<Channel>()
+    private var master = listOf<Channel>()        // every channel in the world list
+    private var all = listOf<Channel>()           // channels of the open category
+    private var channels = listOf<Channel>()      // what the channel list shows now
+    private var catRows = listOf<CategoryDef>()
+    private val catCounts = HashMap<CategoryDef, Int>()
+    private var currentCat: CategoryDef? = null
+    private var lastCatPos = 1
+    private var inCategories = true
+
     private var playingIndex = -1
+    private var playingChannel: Channel? = null
     private var fullscreen = false
     private var playlistLoaded = false
     private var splashMinElapsed = false
     private var attempt = 0
     private var currentChannel: Channel? = null
 
-    private val vlcUa = "VLC/3.0.20 LibVLC/3.0.20"
+    private var showOffline = false
+    private var checkDone = false
+    private var checkGen = 0
+    private var executor: java.util.concurrent.ExecutorService? = null
 
+    private val vlcUa = "VLC/3.0.20 LibVLC/3.0.20"
     private val defaultUa =
         "Mozilla/5.0 (Linux; Android 11; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    private val playlistUrls = listOf(
-        "https://iptv-org.github.io/iptv/countries/pk.m3u",
-        "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/pk.m3u"
+    private val indexUrl = "https://iptv-org.github.io/iptv/index.m3u"
+    private val csvUrl = "https://raw.githubusercontent.com/iptv-org/database/master/data/channels.csv"
+    private val pkUrl = "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/pk.m3u"
+
+    private val hollywood = setOf("us", "uk", "ca", "au")
+    private val attrRe = Regex("([\\w-]+)=\"([^\"]*)\"")
+
+    private fun has(c: Channel, vararg k: String): Boolean {
+        for (x in k) if (x in c.cats) return true
+        return false
+    }
+
+    private val categoryDefs = listOf(
+        CategoryDef("PAKISTAN", true),
+        CategoryDef("All Pakistani channels") { it.country == "pk" },
+        CategoryDef("Pakistan: News") { it.country == "pk" && has(it, "news") },
+        CategoryDef("Pakistan: Sports") { it.country == "pk" && has(it, "sports") },
+        CategoryDef("Pakistan: Entertainment & Drama") {
+            it.country == "pk" && has(it, "entertainment", "series", "comedy", "family", "classic")
+        },
+        CategoryDef("Pakistan: Movies & Music") { it.country == "pk" && has(it, "movies", "music") },
+        CategoryDef("Pakistan: Religious") { it.country == "pk" && has(it, "religious") },
+        CategoryDef("Pakistan: Kids") { it.country == "pk" && has(it, "kids", "animation") },
+        CategoryDef("WORLD", true),
+        CategoryDef("Hollywood movies (USA / UK)") { has(it, "movies") && it.country in hollywood },
+        CategoryDef("Movies: all countries") { has(it, "movies") },
+        CategoryDef("Sports: all countries") { has(it, "sports") },
+        CategoryDef("News: all countries") { has(it, "news") },
+        CategoryDef("Entertainment") { has(it, "entertainment") },
+        CategoryDef("Series & drama") { has(it, "series") },
+        CategoryDef("Comedy") { has(it, "comedy") },
+        CategoryDef("Music") { has(it, "music") },
+        CategoryDef("Kids & animation") { has(it, "kids", "animation") },
+        CategoryDef("Documentary") { has(it, "documentary") },
+        CategoryDef("Lifestyle, cooking & travel") { has(it, "lifestyle", "cooking", "travel") },
+        CategoryDef("Business") { has(it, "business") },
+        CategoryDef("Religious") { has(it, "religious") },
+        CategoryDef("Classic & family") { has(it, "classic", "family") },
+        CategoryDef("Science, education & culture") { has(it, "science", "education", "culture") },
+        CategoryDef("Outdoor & auto") { has(it, "outdoor", "auto") },
+        CategoryDef("Weather") { has(it, "weather") },
+        CategoryDef("General") { has(it, "general") },
+        CategoryDef("EVERYTHING", true),
+        CategoryDef("All channels (Pakistan first)") { true }
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,7 +151,9 @@ class MainActivity : AppCompatActivity() {
         splash = findViewById(R.id.splash)
         emptyHint = findViewById(R.id.emptyHint)
         nowPlaying = findViewById(R.id.nowPlaying)
+        headerTitle = findViewById(R.id.headerTitle)
         headerCount = findViewById(R.id.headerCount)
+        footerHint = findViewById(R.id.footerHint)
         spinner = findViewById(R.id.spinner)
         statusBox = findViewById(R.id.statusBox)
         statusTitle = findViewById(R.id.statusTitle)
@@ -134,54 +204,96 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        adapter = ChannelAdapter()
-        list.adapter = adapter
-        list.setOnItemClickListener { _, _, pos, _ -> play(pos) }
+        channelAdapter = ChannelAdapter()
+        categoryAdapter = CategoryAdapter()
+        list.adapter = categoryAdapter
+        list.setOnItemClickListener { _, _, pos, _ ->
+            if (inCategories) {
+                if (pos in catRows.indices && !catRows[pos].isHeader) {
+                    lastCatPos = pos
+                    openCategory(catRows[pos])
+                }
+            } else {
+                play(pos)
+            }
+        }
 
         handler.postDelayed({ splashMinElapsed = true; maybeHideSplash() }, 2500)
-        handler.postDelayed({ splashMinElapsed = true; playlistLoaded = true; maybeHideSplash() }, 10000)
-        loadPlaylist()
+        handler.postDelayed({ splashMinElapsed = true; playlistLoaded = true; maybeHideSplash() }, 12000)
+        loadData(false)
     }
 
-    // ---------- playlist ----------
+    // ---------- loading the world channel list ----------
 
-    private fun loadPlaylist() {
-        playlistLoaded = false
-        showStatus("Loading channels...", "Fetching the Pakistani channel list.", false, null)
-        spinner.visibility = View.VISIBLE
-        thread {
-            var loaded = emptyList<Channel>()
-            var networkFailed = false
-            for (u in playlistUrls) {
-                try {
-                    val conn = URL(u).openConnection()
-                    conn.connectTimeout = 10000
-                    conn.readTimeout = 15000
-                    val text = conn.getInputStream().bufferedReader().use { it.readText() }
-                    loaded = parseM3u(text)
-                    if (loaded.isNotEmpty()) { networkFailed = false; break }
-                } catch (e: Exception) {
-                    networkFailed = true
+    private fun fetch(name: String, urls: List<String>, force: Boolean): String? {
+        val f = java.io.File(cacheDir, name)
+        val fresh = f.exists() && System.currentTimeMillis() - f.lastModified() < 12L * 3600 * 1000
+        if (fresh && !force) {
+            try { return f.readText() } catch (e: Exception) { }
+        }
+        for (u in urls) {
+            try {
+                val conn = URL(u).openConnection()
+                conn.connectTimeout = 10000
+                conn.readTimeout = 40000
+                val text = conn.getInputStream().bufferedReader().use { it.readText() }
+                if (text.isNotBlank()) {
+                    try { f.writeText(text) } catch (e: Exception) { }
+                    return text
                 }
-            }
+            } catch (e: Exception) { }
+        }
+        if (f.exists()) {
+            try { return f.readText() } catch (e: Exception) { }
+        }
+        return null
+    }
+
+    private fun loadData(force: Boolean) {
+        playlistLoaded = false
+        spinner.visibility = View.VISIBLE
+        showStatus(
+            "Loading channels...",
+            "Downloading the world channel list. The first start can take a minute.",
+            false, null
+        )
+        thread {
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
+            val fIdx = pool.submit(java.util.concurrent.Callable { fetch("index.m3u", listOf(indexUrl), force) })
+            val fCsv = pool.submit(java.util.concurrent.Callable { fetch("channels.csv", listOf(csvUrl), force) })
+            val fPk = pool.submit(java.util.concurrent.Callable { fetch("pk.m3u", listOf(pkUrl), force) })
+            val idxText = try { fIdx.get() } catch (e: Exception) { null }
+            val csvText = try { fCsv.get() } catch (e: Exception) { null }
+            val pkText = try { fPk.get() } catch (e: Exception) { null }
+            pool.shutdown()
+
+            val meta = if (csvText != null) parseMeta(csvText) else emptyMap()
+            val seen = HashSet<String>()
+            val out = ArrayList<Channel>()
+            if (pkText != null) parseStreams(pkText, meta, seen, out)
+            if (idxText != null) parseStreams(idxText, meta, seen, out)
+            val sorted = out.sortedWith(
+                compareBy<Channel>({ rank(it) }, { it.country }, { it.name.lowercase(Locale.ROOT) })
+            )
+            val networkFailed = idxText == null && pkText == null
+
             runOnUiThread {
-                channels = loaded
-                adapter.notifyDataSetChanged()
+                master = sorted
                 spinner.visibility = View.GONE
-                if (loaded.isEmpty()) {
-                    headerCount.text = "No channels"
+                if (master.isEmpty()) {
                     showStatus(
                         "Couldn't load the channel list",
                         if (networkFailed)
-                            "The TV couldn't reach the playlist server. Check your internet connection (Settings > Network), then press OK to try again."
+                            "The TV couldn't reach the playlist servers. Check your internet connection (Settings > Network), then press OK to try again."
                         else
                             "The playlist came back empty. Press OK to try again.",
                         true, null
                     )
+                    headerCount.text = "No channels"
                 } else {
-                    headerCount.text = "${loaded.size} channels"
                     statusBox.visibility = View.GONE
-                    list.requestFocus()
+                    buildCategories()
+                    showCategories()
                 }
                 playlistLoaded = true
                 maybeHideSplash()
@@ -189,25 +301,263 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun parseM3u(text: String): List<Channel> {
-        val out = mutableListOf<Channel>()
+    private fun rank(c: Channel): Int = when (c.country) {
+        "pk" -> 0
+        "us" -> 1
+        "uk" -> 2
+        "ca" -> 3
+        "au" -> 4
+        "in" -> 5
+        else -> 6
+    }
+
+    private fun normCountry(s: String): String {
+        val x = s.trim().lowercase(Locale.ROOT)
+        return if (x == "gb") "uk" else x
+    }
+
+    private fun parseCsv(text: String): List<List<String>> {
+        val rows = ArrayList<List<String>>()
+        var row = ArrayList<String>()
+        val sb = StringBuilder()
+        var inQ = false
+        var i = 0
+        val n = text.length
+        while (i < n) {
+            val ch = text[i]
+            if (inQ) {
+                if (ch == '"') {
+                    if (i + 1 < n && text[i + 1] == '"') { sb.append('"'); i++ } else inQ = false
+                } else sb.append(ch)
+            } else {
+                when (ch) {
+                    '"' -> inQ = true
+                    ',' -> { row.add(sb.toString()); sb.setLength(0) }
+                    '\n' -> { row.add(sb.toString()); sb.setLength(0); rows.add(row); row = ArrayList() }
+                    '\r' -> {}
+                    else -> sb.append(ch)
+                }
+            }
+            i++
+        }
+        if (sb.isNotEmpty() || row.isNotEmpty()) { row.add(sb.toString()); rows.add(row) }
+        return rows
+    }
+
+    private fun parseMeta(text: String): Map<String, Meta> {
+        val rows = parseCsv(text)
+        if (rows.isEmpty()) return emptyMap()
+        val h = rows[0]
+        val iId = h.indexOf("id")
+        val iCountry = h.indexOf("country")
+        val iCats = h.indexOf("categories")
+        val iNsfw = h.indexOf("is_nsfw")
+        val iClosed = h.indexOf("closed")
+        if (iId < 0 || iCountry < 0 || iCats < 0) return emptyMap()
+        val map = HashMap<String, Meta>(rows.size * 2)
+        for (k in 1 until rows.size) {
+            val r = rows[k]
+            if (r.size <= iCats || r.size <= iCountry) continue
+            val cats = r[iCats].split(";").map { it.trim().lowercase(Locale.ROOT) }.filter { it.isNotEmpty() }.toSet()
+            val nsfw = iNsfw >= 0 && iNsfw < r.size && r[iNsfw].equals("TRUE", true)
+            val closed = iClosed >= 0 && iClosed < r.size && r[iClosed].isNotBlank()
+            map[r[iId]] = Meta(normCountry(r[iCountry]), cats, nsfw || closed || "xxx" in cats)
+        }
+        return map
+    }
+
+    private fun parseStreams(text: String, meta: Map<String, Meta>, seen: HashSet<String>, out: MutableList<Channel>) {
         var name: String? = null
+        var attrs: Map<String, String> = emptyMap()
         var referrer: String? = null
         var ua: String? = null
-        for (line in text.lines().map { it.trim() }) {
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
             when {
-                line.startsWith("#EXTINF") -> name = line.substringAfterLast(",").trim()
-                line.startsWith("#EXTVLCOPT:http-referrer=") ->
-                    referrer = line.substringAfter("=").trim()
-                line.startsWith("#EXTVLCOPT:http-user-agent=") ->
-                    ua = line.substringAfter("=").trim()
+                line.startsWith("#EXTINF") -> {
+                    name = line.substringAfterLast(",").trim()
+                    val m = HashMap<String, String>()
+                    for (r in attrRe.findAll(line)) m[r.groupValues[1]] = r.groupValues[2]
+                    attrs = m
+                    referrer = null
+                    ua = null
+                }
+                line.startsWith("#EXTVLCOPT:http-referrer=") -> referrer = line.substringAfter("=").trim()
+                line.startsWith("#EXTVLCOPT:http-user-agent=") -> ua = line.substringAfter("=").trim()
                 line.isNotEmpty() && !line.startsWith("#") && name != null -> {
-                    out.add(Channel(name!!, line, referrer, ua))
-                    name = null; referrer = null; ua = null
+                    if ((line.startsWith("http://") || line.startsWith("https://")) && seen.add(line)) {
+                        val id = (attrs["tvg-id"] ?: "").substringBefore("@")
+                        val md = meta[id]
+                        val group = attrs["group-title"] ?: ""
+                        val skip = (md != null && md.bad) || group.contains("xxx", true)
+                        if (!skip) {
+                            val country = normCountry(md?.country ?: id.substringAfterLast('.', ""))
+                            val cats = if (md != null && md.cats.isNotEmpty()) md.cats
+                            else group.split(";").map { it.trim().lowercase(Locale.ROOT) }
+                                .filter { it.isNotEmpty() && it != "undefined" }.toSet()
+                            out.add(Channel(name!!, line, referrer, ua, country, cats))
+                        }
+                    }
+                    name = null
+                    attrs = emptyMap()
+                    referrer = null
+                    ua = null
                 }
             }
         }
-        return out
+    }
+
+    // ---------- categories / channel list ----------
+
+    private fun buildCategories() {
+        val rows = ArrayList<CategoryDef>()
+        var pending: CategoryDef? = null
+        catCounts.clear()
+        for (d in categoryDefs) {
+            if (d.isHeader) { pending = d; continue }
+            val n = master.count(d.match)
+            if (n > 0) {
+                val p = pending
+                if (p != null) { rows.add(p); pending = null }
+                rows.add(d)
+                catCounts[d] = n
+            }
+        }
+        catRows = rows
+        categoryAdapter.notifyDataSetChanged()
+    }
+
+    private fun showCategories() {
+        inCategories = true
+        checkGen++
+        executor?.shutdownNow()
+        headerTitle.text = "PK IPTV"
+        headerCount.text = "Choose a category  -  ${master.size} channels"
+        footerHint.text = "OK: open   Menu: refresh list"
+        list.adapter = categoryAdapter
+        categoryAdapter.notifyDataSetChanged()
+        val pos = if (lastCatPos in catRows.indices) lastCatPos else 1
+        list.setSelection(pos)
+        list.requestFocus()
+    }
+
+    private fun openCategory(def: CategoryDef) {
+        inCategories = false
+        currentCat = def
+        all = master.filter(def.match)
+        checkDone = false
+        headerTitle.text = def.title
+        footerHint.text = "OK: play   Right: fullscreen   Left: categories   Menu: show offline"
+        list.adapter = channelAdapter
+        applyFilter()
+        list.setSelection(0)
+        list.requestFocus()
+        startHealthCheck()
+    }
+
+    private fun applyFilter() {
+        val keep = playingChannel
+        var shown = if (showOffline || !checkDone) all else all.filter { it.state != 2 }
+        if (shown.isEmpty()) shown = all          // never leave the list empty
+        channels = shown
+        playingIndex = if (keep == null) -1 else channels.indexOfFirst { it === keep }
+        channelAdapter.notifyDataSetChanged()
+        updateHeader()
+    }
+
+    private fun updateHeader() {
+        val ok = all.count { it.state == 1 }
+        val bad = all.count { it.state == 2 }
+        val unknown = all.size - ok - bad
+        headerCount.text = when {
+            all.isEmpty() -> "No channels"
+            !checkDone -> "Checking ${ok + bad}/${all.size}...  $ok working"
+            showOffline -> "${all.size} channels  -  $ok working"
+            unknown > 0 -> "$ok working  -  $bad offline hidden  -  $unknown unchecked"
+            else -> "$ok working  -  $bad offline hidden"
+        }
+    }
+
+    // ---------- channel health check ----------
+
+    private fun refreshAfterCheck() {
+        val old = channels
+        val firstPos = list.firstVisiblePosition
+        val top = list.getChildAt(0)?.top ?: 0
+        applyFilter()
+        var anchor = -1
+        var i = firstPos
+        var usedFirst = true
+        while (i < old.size && anchor < 0) {
+            val target = old[i]
+            val idx = channels.indexOfFirst { it === target }
+            if (idx >= 0) anchor = idx else usedFirst = false
+            i++
+        }
+        if (anchor >= 0) list.setSelectionFromTop(anchor, if (usedFirst) top else 0)
+    }
+
+    private fun startHealthCheck() {
+        val gen = ++checkGen
+        executor?.shutdownNow()
+        val todo = all.filter { it.state == 0 }.take(1500)
+        if (todo.isEmpty()) {
+            checkDone = true
+            applyFilter()
+            return
+        }
+        checkDone = false
+        updateHeader()
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(32)
+        executor = pool
+        val done = java.util.concurrent.atomic.AtomicInteger(0)
+        val total = todo.size
+        for (c in todo) {
+            pool.execute {
+                if (gen == checkGen) {
+                    val ok = try { probe(c) } catch (e: Exception) { false }
+                    c.state = if (ok) 1 else 2
+                    val n = done.incrementAndGet()
+                    if (n % 5 == 0 || n == total) {
+                        runOnUiThread {
+                            if (gen == checkGen) {
+                                if (n == total) { checkDone = true; refreshAfterCheck() }
+                                else { channelAdapter.notifyDataSetChanged(); updateHeader() }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pool.shutdown()
+    }
+
+    // Quick test: does the server answer with something that looks like a stream?
+    private fun probe(c: Channel): Boolean {
+        for ((ua, ref) in identities(c).take(2)) {
+            try {
+                val conn = URL(c.url).openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.instanceFollowRedirects = true
+                conn.setRequestProperty("User-Agent", ua)
+                ref?.let { conn.setRequestProperty("Referer", it) }
+                val code = conn.responseCode
+                if (code in 300..399) { conn.disconnect(); return true }   // redirect: the player follows it
+                if (code in 200..299) {
+                    val buf = ByteArray(2048)
+                    val n = conn.inputStream.read(buf)
+                    conn.disconnect()
+                    if (n <= 0) continue
+                    if (c.url.contains(".m3u8")) {
+                        if (String(buf, 0, n).contains("#EXTM3U")) return true
+                    } else return true
+                } else {
+                    conn.disconnect()
+                }
+            } catch (e: Exception) { /* try next identity */ }
+        }
+        return false
     }
 
     // ---------- playback ----------
@@ -216,12 +566,12 @@ class MainActivity : AppCompatActivity() {
         if (index < 0 || index >= channels.size) return
         val c = channels[index]
         playingIndex = index
-        adapter.notifyDataSetChanged()
+        playingChannel = c
+        channelAdapter.notifyDataSetChanged()
         emptyHint.visibility = View.GONE
         showStatus("Connecting to ${c.name}...", "Please wait a moment.", false, null)
         spinner.visibility = View.VISIBLE
         showNowPlaying(c.name)
-
         currentChannel = c
         attempt = 0
         startPlayback(c)
@@ -262,9 +612,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stepChannel(delta: Int) {
-        if (channels.isEmpty()) return
+        if (channels.isEmpty() || inCategories && playingChannel == null) return
         val next = if (playingIndex < 0) 0 else (playingIndex + delta + channels.size) % channels.size
-        list.setSelection(next)
+        if (!inCategories) list.setSelection(next)
         play(next)
     }
 
@@ -419,13 +769,21 @@ class MainActivity : AppCompatActivity() {
                 KeyEvent.KEYCODE_CHANNEL_UP -> { stepChannel(-1); return true }
                 KeyEvent.KEYCODE_CHANNEL_DOWN -> { stepChannel(1); return true }
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER ->
-                    if (channels.isEmpty() && playlistLoaded) { loadPlaylist(); return true }
+                    if (master.isEmpty() && playlistLoaded) { loadData(true); return true }
                 KeyEvent.KEYCODE_DPAD_RIGHT ->
-                    if (!fullscreen && playingIndex >= 0) { setFullscreen(true); return true }
-                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MENU ->
+                    if (!fullscreen && !inCategories && playingIndex >= 0) { setFullscreen(true); return true }
+                KeyEvent.KEYCODE_DPAD_LEFT ->
                     if (fullscreen) { setFullscreen(false); return true }
+                    else if (!inCategories) { showCategories(); return true }
+                KeyEvent.KEYCODE_MENU -> {
+                    if (fullscreen) setFullscreen(false)
+                    else if (inCategories) loadData(true)
+                    else if (checkDone && all.isNotEmpty()) { showOffline = !showOffline; refreshAfterCheck() }
+                    return true
+                }
                 KeyEvent.KEYCODE_BACK ->
                     if (fullscreen) { setFullscreen(false); return true }
+                    else if (!inCategories) { showCategories(); return true }
                 KeyEvent.KEYCODE_DPAD_UP ->
                     if (fullscreen) { stepChannel(-1); return true }
                 KeyEvent.KEYCODE_DPAD_DOWN ->
@@ -435,7 +793,7 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchKeyEvent(e)
     }
 
-    // ---------- list adapter ----------
+    // ---------- list adapters ----------
 
     private inner class ChannelAdapter : BaseAdapter() {
         override fun getCount() = channels.size
@@ -443,13 +801,53 @@ class MainActivity : AppCompatActivity() {
         override fun getItemId(position: Int) = position.toLong()
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val v = convertView ?: layoutInflater.inflate(R.layout.item_channel, parent, false)
+            val c = channels[position]
             val playing = position == playingIndex
-            v.findViewById<TextView>(R.id.num).text = String.format(Locale.US, "%02d", position + 1)
+            val num = v.findViewById<TextView>(R.id.num)
+            num.visibility = View.VISIBLE
+            num.text = if (c.country.isEmpty()) "--" else c.country.uppercase(Locale.ROOT)
             val name = v.findViewById<TextView>(R.id.name)
-            name.text = channels[position].name
+            name.text = c.name
             name.setTextColor(if (playing) 0xFF60A5FA.toInt() else 0xFFFFFFFF.toInt())
             v.findViewById<TextView>(R.id.marker).visibility =
                 if (playing) View.VISIBLE else View.INVISIBLE
+            val dot = v.findViewById<TextView>(R.id.dot)
+            dot.text = "●"
+            dot.setTextColor(
+                when (c.state) {
+                    1 -> 0xFF22C55E.toInt()
+                    2 -> 0xFFEF4444.toInt()
+                    else -> 0xFF6B7280.toInt()
+                }
+            )
+            return v
+        }
+    }
+
+    private inner class CategoryAdapter : BaseAdapter() {
+        override fun getCount() = catRows.size
+        override fun getItem(position: Int) = catRows[position]
+        override fun getItemId(position: Int) = position.toLong()
+        override fun areAllItemsEnabled() = false
+        override fun isEnabled(position: Int) = !catRows[position].isHeader
+        override fun getViewTypeCount() = 2
+        override fun getItemViewType(position: Int) = if (catRows[position].isHeader) 0 else 1
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val d = catRows[position]
+            if (d.isHeader) {
+                val h = convertView ?: layoutInflater.inflate(R.layout.item_header, parent, false)
+                (h as TextView).text = d.title
+                return h
+            }
+            val v = convertView ?: layoutInflater.inflate(R.layout.item_channel, parent, false)
+            v.findViewById<TextView>(R.id.marker).visibility = View.GONE
+            v.findViewById<TextView>(R.id.num).visibility = View.GONE
+            val name = v.findViewById<TextView>(R.id.name)
+            name.text = d.title
+            name.setTextColor(0xFFFFFFFF.toInt())
+            val count = v.findViewById<TextView>(R.id.dot)
+            count.text = String.format(Locale.US, "%,d", catCounts[d] ?: 0)
+            count.setTextColor(0xFF9CA3AF.toInt())
             return v
         }
     }
@@ -470,6 +868,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        executor?.shutdownNow()
         super.onDestroy()
         player.release()
     }
