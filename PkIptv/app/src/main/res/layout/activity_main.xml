@@ -7,7 +7,17 @@
         android:layout_width="320dp" android:layout_height="match_parent"
         android:background="#202020" android:choiceMode="singleChoice"
         android:listSelector="#3367D6" android:divider="#333333" android:dividerHeight="1dp"/>
-    <androidx.media3.ui.PlayerView android:id="@+id/player"
+    <FrameLayout
         android:layout_width="0dp" android:layout_height="match_parent"
-        android:layout_weight="1" app:resize_mode="fit"/>
+        android:layout_weight="1">
+        <androidx.media3.ui.PlayerView android:id="@+id/player"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            app:resize_mode="fit"/>
+        <TextView android:id="@+id/status"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#CC000000" android:textColor="#FFFFFF"
+            android:textSize="18sp" android:padding="12dp"
+            android:visibility="gone"/>
+    </FrameLayout>
 </LinearLayout>
