@@ -38,6 +38,7 @@ data class Channel(
 class CategoryDef(
     val title: String,
     val isHeader: Boolean = false,
+    val alwaysShow: Boolean = false,
     val match: (Channel) -> Boolean = { false }
 )
 
@@ -73,7 +74,7 @@ class MainActivity : AppCompatActivity() {
     private var catRows = listOf<CategoryDef>()
     private val catCounts = HashMap<CategoryDef, Int>()
     private var currentCat: CategoryDef? = null
-    private var lastCatPos = 1
+    private var lastCatPos = -1
     private var inCategories = true
 
     private var playingIndex = -1
@@ -105,7 +106,12 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
+    private val favs = LinkedHashSet<String>()      // favourite channel URLs
+    private val favDef = CategoryDef("★ My favourites", alwaysShow = true) { it.url in favs }
+    private var okLongDone = false
+
     private val categoryDefs = listOf(
+        favDef,
         CategoryDef("PAKISTAN", true),
         CategoryDef("All Pakistani channels") { it.country == "pk" },
         CategoryDef("Pakistan: News") { it.country == "pk" && has(it, "news") },
@@ -142,6 +148,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         trustAllCertificates()
+        loadFavourites()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
 
@@ -416,7 +423,7 @@ class MainActivity : AppCompatActivity() {
         for (d in categoryDefs) {
             if (d.isHeader) { pending = d; continue }
             val n = master.count(d.match)
-            if (n > 0) {
+            if (n > 0 || d.alwaysShow) {
                 val p = pending
                 if (p != null) { rows.add(p); pending = null }
                 rows.add(d)
@@ -436,7 +443,10 @@ class MainActivity : AppCompatActivity() {
         footerHint.text = "OK: open   Menu: refresh list"
         list.adapter = categoryAdapter
         categoryAdapter.notifyDataSetChanged()
-        val pos = if (lastCatPos in catRows.indices) lastCatPos else 1
+        val firstReal = catRows.indexOfFirst { !it.isHeader && it !== favDef }
+        val pos = if (lastCatPos in catRows.indices) lastCatPos
+        else if (favs.isNotEmpty()) 0
+        else if (firstReal >= 0) firstReal else 0
         list.setSelection(pos)
         list.requestFocus()
     }
@@ -447,7 +457,7 @@ class MainActivity : AppCompatActivity() {
         all = master.filter(def.match)
         checkDone = false
         headerTitle.text = def.title
-        footerHint.text = "OK: play   Right: fullscreen   Left: categories   Menu: show offline"
+        footerHint.text = "OK: play   Hold OK: favourite   Right: fullscreen   Left: categories   Menu: show offline"
         list.adapter = channelAdapter
         applyFilter()
         list.setSelection(0)
@@ -470,7 +480,7 @@ class MainActivity : AppCompatActivity() {
         val bad = all.count { it.state == 2 }
         val unknown = all.size - ok - bad
         headerCount.text = when {
-            all.isEmpty() -> "No channels"
+            all.isEmpty() -> if (currentCat === favDef) "Hold OK on any channel to add it here" else "No channels"
             !checkDone -> "Checking ${ok + bad}/${all.size}...  $ok working"
             showOffline -> "${all.size} channels  -  $ok working"
             unknown > 0 -> "$ok working  -  $bad offline hidden  -  $unknown unchecked"
@@ -618,11 +628,46 @@ class MainActivity : AppCompatActivity() {
         play(next)
     }
 
-    private fun showNowPlaying(name: String) {
+    private fun showNowPlaying(name: String) = flash("▶  $name", 4000)
+
+    private fun flash(msg: String, ms: Long) {
         handler.removeCallbacks(hideNowPlaying)
-        nowPlaying.text = "▶  $name"
+        nowPlaying.text = msg
         nowPlaying.visibility = View.VISIBLE
-        handler.postDelayed(hideNowPlaying, 4000)
+        handler.postDelayed(hideNowPlaying, ms)
+    }
+
+    // ---------- favourites ----------
+
+    private fun loadFavourites() {
+        val saved = getSharedPreferences("pkiptv", MODE_PRIVATE).getString("favs", "") ?: ""
+        favs.clear()
+        favs.addAll(saved.split("\n").filter { it.isNotBlank() })
+    }
+
+    private fun saveFavourites() {
+        getSharedPreferences("pkiptv", MODE_PRIVATE)
+            .edit().putString("favs", favs.joinToString("\n")).apply()
+    }
+
+    private fun toggleFavourite(index: Int) {
+        if (index !in channels.indices) return
+        val c = channels[index]
+        val added = favs.add(c.url)
+        if (!added) favs.remove(c.url)
+        saveFavourites()
+        catCounts[favDef] = master.count { it.url in favs }
+        flash(
+            if (added) "★  Added to favourites: ${c.name}" else "Removed from favourites: ${c.name}",
+            2500
+        )
+        if (currentCat === favDef && !added) {
+            all = master.filter(favDef.match)
+            applyFilter()
+            if (channels.isNotEmpty()) list.setSelection(index.coerceAtMost(channels.size - 1))
+        } else {
+            channelAdapter.notifyDataSetChanged()
+        }
     }
 
     // ---------- friendly error messages ----------
@@ -764,12 +809,46 @@ class MainActivity : AppCompatActivity() {
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
         if (splash.visibility == View.VISIBLE) return true
+
+        // OK button: short press opens/plays, long press toggles favourite.
+        if (e.keyCode == KeyEvent.KEYCODE_DPAD_CENTER || e.keyCode == KeyEvent.KEYCODE_ENTER) {
+            if (master.isEmpty() && playlistLoaded) {
+                if (e.action == KeyEvent.ACTION_DOWN && e.repeatCount == 0) loadData(true)
+                return true
+            }
+            if (e.action == KeyEvent.ACTION_DOWN) {
+                if (e.repeatCount == 0) {
+                    okLongDone = false
+                } else if (!okLongDone && e.eventTime - e.downTime >= 700) {
+                    okLongDone = true
+                    if (fullscreen) toggleFavourite(playingIndex)
+                    else if (!inCategories) toggleFavourite(list.selectedItemPosition)
+                }
+            } else if (e.action == KeyEvent.ACTION_UP) {
+                if (!okLongDone) {
+                    if (fullscreen) {
+                        playingChannel?.let { flash("▶  ${it.name}", 3000) }
+                    } else {
+                        val pos = list.selectedItemPosition
+                        if (inCategories) {
+                            if (pos in catRows.indices && !catRows[pos].isHeader) {
+                                lastCatPos = pos
+                                openCategory(catRows[pos])
+                            }
+                        } else if (pos >= 0) {
+                            play(pos)
+                        }
+                    }
+                }
+                okLongDone = false
+            }
+            return true
+        }
+
         if (e.action == KeyEvent.ACTION_DOWN) {
             when (e.keyCode) {
                 KeyEvent.KEYCODE_CHANNEL_UP -> { stepChannel(-1); return true }
                 KeyEvent.KEYCODE_CHANNEL_DOWN -> { stepChannel(1); return true }
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER ->
-                    if (master.isEmpty() && playlistLoaded) { loadData(true); return true }
                 KeyEvent.KEYCODE_DPAD_RIGHT ->
                     if (!fullscreen && !inCategories && playingIndex >= 0) { setFullscreen(true); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT ->
@@ -807,7 +886,7 @@ class MainActivity : AppCompatActivity() {
             num.visibility = View.VISIBLE
             num.text = if (c.country.isEmpty()) "--" else c.country.uppercase(Locale.ROOT)
             val name = v.findViewById<TextView>(R.id.name)
-            name.text = c.name
+            name.text = if (c.url in favs) "★ ${c.name}" else c.name
             name.setTextColor(if (playing) 0xFF60A5FA.toInt() else 0xFFFFFFFF.toInt())
             v.findViewById<TextView>(R.id.marker).visibility =
                 if (playing) View.VISIBLE else View.INVISIBLE
