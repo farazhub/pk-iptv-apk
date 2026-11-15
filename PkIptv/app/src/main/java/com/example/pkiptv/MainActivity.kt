@@ -866,6 +866,28 @@ class MainActivity : AppCompatActivity() {
         javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier { _, _ -> true }
     }
 
+    // Stop the stream (and its sound) whenever the app leaves the screen, e.g. Home button.
+    private var resumeOnStart = false
+
+    override fun onStop() {
+        super.onStop()
+        resumeOnStart = currentChannel != null && player.playbackState != Player.STATE_IDLE
+        player.stop()
+        spinner.visibility = View.GONE
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val ch = currentChannel
+        if (resumeOnStart && ch != null) {
+            resumeOnStart = false
+            attempt = 0
+            spinner.visibility = View.VISIBLE
+            showStatus("Reconnecting to ${ch.name}...", "Resuming where you left off.", false, null)
+            startPlayback(ch)
+        }
+    }
+
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         executor?.shutdownNow()
